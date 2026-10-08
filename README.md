@@ -27,76 +27,30 @@ This document outlines the 5 key architectural decisions made during the design 
 * **Justification:** Guarantees zero runtime dependencies on legacy artifacts, supporting pure Spec-Driven Development (SDD). Integrated observability primitives provide Day-Two operational visibility from the initial deployment window.
 
 ---
-
 # Analysis of Legacy Code Gaps & Ambiguity Resolution
 
-This document outlines the structural gaps identified in the legacy assets and the engineering assumptions applied to move the modernization forward.
+This document summarizes the structural gaps discovered in the legacy system and the precise engineering decisions applied to deliver a production-ready, .NET 8 Web API.
 
 ---
 
-## 1. Identified Legacy Gaps & Immediate Resolution
+### 1. Schema Gaps & Data Initialization
+* **Identified Gaps:** `schema.sql` omits `Schools`, `SchoolTerms`, and `AttendanceSubmissionLog`. The roster query, grade filters, and `sp_GetStudentsForAttendance` are missing entirely.
+* **Resolution:** Out-of-slice capabilities (roster loading, reporting, terms management) are excluded. In `Development`, the database uses EF Core `EnsureCreated()` to bootstrap schema rules and automatically seeds **Demo School 1**, synthetic students (**IDs 1001/1002**), status codes (**P/A/EA/T**), and one active term. Production environments must use versioned migrations.
 
-### Missing Core Schema Tables (`Schools`, `SchoolTerms`, `AttendanceSubmissionLog`)
-* **The Ambiguity:** Relational integrity constraints and foreign key targets were missing from the legacy snapshot, hiding critical business rules regarding school operational contexts and submission logging lifetimes.
-* **How It Was Handled:** 
-  * Modeled placeholder **Value Objects and Entities** inside `Core.Domain` to represent these concepts based on their usage in the stored procedures.
-  * Assumed a flat structure for `Schools` and mapped `SchoolTerms` as an invariant boundary (Start/End dates) to ensure attendance calculations fall within valid academic windows.
-  * Encapsulated `AttendanceSubmissionLog` directly into an **Infrastructure-level Auditing Concern**, separating it from core domain behavior.
+### 2. Business Logic Refactoring & Correction
+* **Identified Gaps:** Legacy code relies on an undefined `SchoolYear()` function and introduces an aggregation bug by evaluating the user-requested target date within its absence counters instead of checking individual record dates.
+* **Resolution:** Replaced relational stored procedures with C# logic. The modern backend recalculates all statistics and metrics on save directly from attendance rows to eliminate stale state data, evaluating absence history inside a strict calendar window of `[Sep 1, next Sep 1)`.
 
-### Incomplete Legacy Form File (frmDailyAttendance.frm)
-* **The Ambiguity:** The form file looks incomplete.
-* **How It Was Handled:** 
-  * Decoupled the API contract completely from the legacy view state. 
+### 3. Pipeline Safeguards & Domain Invariants
+* **Identified Gaps:** Legacy processes handle input via unsafe cursor loops (last-write-wins) and unescaped raw XML concatenation without verifying profile or code validity.
+* **Resolution:** Replaced the legacy pipeline with clear, structured JSON DTO payloads. The API strictly rejects payloads containing duplicate student IDs within the same batch, inactive profiles, or invalid codes. A system absenteeism threshold fallback of **10** is automatically applied if left unset.
 
----
+### 4. Idempotency & Distributed Concurrency
+* **Identified Gaps:** The legacy UI captures zero execution context or actor identity, risking duplicate database entries under intermittent network drops.
+* **Resolution:** Designed a 3-axis stateful tracking key scoped by **Subject**, **Endpoint**, and **School ID**. Successful responses cache for **24 hours**, while failed attempts release immediately for retry. Concurrent duplicate requests block and wait for up to **10 seconds** before gracefully throwing a `409 Conflict` error.
 
-## 2. Advanced Strategic Assumptions (Potential Blind Spots)
-
-To ensure production readiness, the following architectural blind spots must be validated with stakeholders:
-
-### Multi-Tenancy & Data Isolation (The `Schools` Ambiguity)
-* **The Assumption Made:** The system assumes a shared database architecture where a school ID is passed explicitly in the context header or command payload.
-* **What Could Be Missed:** If Stakehoders requires hard compliance-based data isolation per school district, this flat approach must be refactored into a **Multi-Tenant DB schema** or independent SQLite file routing per tenant.
-
-### Complex Academic Calendars (`SchoolTerms` Overlaps)
-* **The Assumption Made:** A student belongs to one school term at a time with clear, linear chronological windows.
-* **What Could Be Missed:** Tracking structural edge cases like rolling enrollment, alternative tracks, mid-term transfers, or overlapping specialized summer terms that invalidate simple date-range lookups.
-
-### Audit Compliance vs. Transactional State (`AttendanceSubmissionLog`)
-* **The Assumption Made:** The submission log acts purely as an append-only ledger for telemetry and operational auditing.
-* **What Could Be Missed:** The log might have historically driven downstream processes (e.g., payroll triggers, state-funding reporting, or integration messaging). If so, it must be promoted to a **Domain Event / Outbox Pattern** consumer rather than an application-layer side effect.
-
-### Batch Payload Scale & Timeout Risk
-* **The Assumption Made:** Batch attendance updates represent localized student cohorts (e.g., 30–50 students per payload) processed synchronously.
-* **What Could Be Missed:** If school administrators submit district-wide or school-wide batch payloads (thousands of rows) via a single request, the synchronous approach risks thread starvation and API timeouts. This would necessitate shifting to an **Asynchronous Queue / Background Worker** model.
+### 5. Authentication & Context Boundaries
+* **Identified Gaps:** The old layer logs events using a generic DB `system-user` session without true identity mapping.
+* **Resolution:** Audit actors map to the authenticated JWT `subject` claim (falling back to `demo-user` in Dev). School claims grant explicit visibility into matching student cohorts. Production rules dictate issuing narrower `student_id` scopes to enforce tight policy isolation.
 
 
-
-## Prerequisites and run
-Install a .NET 8 SDK. From this folder run:
-
-```powershell
-dotnet restore AttendanceSystem.sln
-dotnet build AttendanceSystem.sln
-dotnet test AttendanceSystem.sln
-cd src\WebAPI
-dotnet run
-```
-
-The app listens on the URL printed by `dotnet run`; Swagger UI is `/swagger` in Development. SQLite file is `src\WebAPI\students.db` when launched from that project directory. Startup creates its schema and seeds synthetic data only in Development. `/health/live` is liveness; `/health/ready` verifies SQLite connectivity.
-
-## Authentication
-Development only: `POST /api/auth/demo-token?schoolId=1` returns a one-hour JWT scoped to demo school 1. The checked-in development signing key is intentionally public/test-only and must never be used beyond local development. Production must set `Jwt__SigningKey` (at least 32 UTF-8 bytes), `Jwt__Issuer`, `Jwt__Audience`, a secure external issuer/secret store, and issue narrow `school_id`/`student_id` claims; disable `SeedDemoData`. Never deploy the demo-token endpoint/key.
-
-## API quick example
-Obtain a local token, then:
-
-```powershell
-$token = (Invoke-RestMethod -Method Post 'http://localhost:5000/api/auth/demo-token?schoolId=1').accessToken
-$body = @{ attendanceDate='2026-10-07'; entries=@(@{ studentId=1001; code='A'; minutesLate=0; notes='' }) } | ConvertTo-Json -Depth 5
-Invoke-RestMethod -Method Post -Uri 'http://localhost:5000/api/schools/1/attendance' -Headers @{ Authorization="Bearer $token"; 'Idempotency-Key'=[guid]::NewGuid().ToString() } -ContentType 'application/json' -Body $body
-Invoke-RestMethod -Headers @{ Authorization="Bearer $token" } 'http://localhost:5000/api/students/1001/attendance'
-Invoke-RestMethod -Headers @{ Authorization="Bearer $token" } 'http://localhost:5000/api/students/1001/attendance/chronic-absence'
-```
-
-Change the URL to the actual Kestrel URL. Logs are written to the console; attendance notes/student identity are excluded. OpenTelemetry instruments ASP.NET Core, HTTP, and EF Core activity. For local traces, start an OTLP-compatible collector/viewer such as Jaeger, set `$env:OTEL_EXPORTER_OTLP_ENDPOINT="http://localhost:4317"` before `dotnet run`, then inspect the `AttendanceSystem.WebAPI` service in that viewer. The exporter is optional; without the variable, the API runs normally without an external service. API behavior and gaps are fully described in `specs/`.
