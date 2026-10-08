@@ -1,0 +1,6 @@
+**/bin/
+**/obj/
+**/students.db
+**/students.db-shm
+**/students.db-wal
+.vs/
